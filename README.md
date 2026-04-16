@@ -2,6 +2,36 @@
 
 A GitHub Action that detects duplicate code on pull requests using **two complementary engines** and posts a single unified PR comment with base-vs-PR comparison.
 
+## Why we built this
+
+Agentic programming makes duplicate code a much bigger problem. LLM-based agents tend to copy patterns they've already seen in the codebase rather than refactor to reuse them, and without a hard gate, duplication quietly accumulates. We wanted a simple CI check that:
+
+1. Runs on every PR automatically
+2. Fails the build if a PR increases duplication (not just if it exceeds some absolute ceiling)
+3. Posts a clear comparison comment so the author can see exactly what changed
+4. Points at specific lines of new duplication in the PR diff
+
+After surveying the GitHub Marketplace, no existing action does all four. So we built this.
+
+## How it's different from other tools
+
+### [platisd/duplicate-code-detection-tool](https://github.com/platisd/duplicate-code-detection-tool) — complementary, different approach
+
+This is the most prominent existing tool (~205 stars). It uses **gensim TF-IDF cosine similarity** to produce a *whole-file similarity score* — it tells you "these two files are 45% similar" but doesn't point at specific duplicated blocks. It's great for catching files that should be merged or refactored at an architectural level.
+
+Our action is the inverse: **we find specific copy-pasted blocks** with line numbers, using token-based detectors (PMD CPD + jscpd). We tell you "lines 50-65 here are duplicated with lines 120-135 over there."
+
+**The two tools are complementary, not competing.** We recommend running both:
+
+- Use `platisd/duplicate-code-detection-tool` to spot files that are semantically similar overall
+- Use this action to spot exact copy-paste blocks that should be refactored into shared helpers
+
+We've also submitted a PR upstream to add base-vs-PR comparison to their tool so it can catch regressions the way this action does.
+
+### Stacked PR detection tools (jscpd-action, pmd-github-action, etc.)
+
+A handful of marketplace actions wrap jscpd or PMD CPD, but none of them compare the PR against its base branch — they just report total duplication in the PR. That means you can't tell if a PR *introduced* duplication or just inherited it. This action is the only one we found that does the delta comparison, which is what you actually want to gate merges on.
+
 ## Why two engines?
 
 | Engine | Strength |
