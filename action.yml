@@ -1,0 +1,118 @@
+name: 'Duplicate Code Cross-Check'
+description: 'Detect duplicate code using PMD CPD + jscpd with base-vs-PR comparison'
+author: 'Antony Stubbs'
+branding:
+  icon: copy
+  color: purple
+
+inputs:
+  github-token:
+    description: 'GitHub token for posting PR comments and review annotations'
+    required: true
+  directories:
+    description: 'Space-separated list of directories to scan'
+    required: true
+  file-extensions:
+    description: 'Comma-separated list of file extensions to count for percentage calculation'
+    required: false
+    default: 'java'
+  cpd-language:
+    description: 'PMD CPD language (java, python, kotlin, cpp, csharp, go, javascript, ruby, scala, etc.)'
+    required: false
+    default: 'java'
+  cpd-min-tokens:
+    description: 'PMD CPD minimum token count to flag as a clone'
+    required: false
+    default: '70'
+  cpd-max-duplication:
+    description: 'PMD CPD fails if total duplication exceeds this percentage'
+    required: false
+    default: '5'
+  cpd-max-increase:
+    description: 'PMD CPD fails if duplication increases vs base branch by more than this percentage'
+    required: false
+    default: '0.1'
+  jscpd-file-pattern:
+    description: 'jscpd glob pattern for files to scan'
+    required: false
+    default: '**/*.java'
+  jscpd-ignore-pattern:
+    description: 'jscpd comma-separated glob patterns to ignore'
+    required: false
+    default: '**/target/**,**/node_modules/**,**/build/**,**/dist/**'
+  jscpd-min-lines:
+    description: 'jscpd minimum line count to flag as a clone'
+    required: false
+    default: '6'
+  jscpd-min-tokens:
+    description: 'jscpd minimum token count to flag as a clone'
+    required: false
+    default: '70'
+  jscpd-max-duplication:
+    description: 'jscpd fails if total duplication exceeds this percentage'
+    required: false
+    default: '4'
+  jscpd-max-increase:
+    description: 'jscpd fails if duplication increases vs base branch by more than this percentage'
+    required: false
+    default: '0.1'
+  pmd-version:
+    description: 'PMD version to install'
+    required: false
+    default: '7.9.0'
+
+runs:
+  using: 'composite'
+  steps:
+    - name: Setup Java (for PMD CPD)
+      uses: actions/setup-java@v5
+      with:
+        distribution: 'temurin'
+        java-version: '17'
+
+    - name: Setup Node.js (for jscpd and report script)
+      uses: actions/setup-node@v4
+      with:
+        node-version: '22'
+
+    - name: Install PMD
+      shell: bash
+      run: |
+        wget -q "https://github.com/pmd/pmd/releases/download/pmd_releases%2F${{ inputs.pmd-version }}/pmd-dist-${{ inputs.pmd-version }}-bin.zip"
+        unzip -q "pmd-dist-${{ inputs.pmd-version }}-bin.zip"
+        echo "$PWD/pmd-bin-${{ inputs.pmd-version }}/bin" >> $GITHUB_PATH
+
+    - name: Run both engines on base branch
+      shell: bash
+      run: |
+        git checkout ${{ github.event.pull_request.base.sha }} --quiet 2>/dev/null || true
+        pmd cpd --dir ${{ inputs.directories }} --language ${{ inputs.cpd-language }} --minimum-tokens ${{ inputs.cpd-min-tokens }} --format xml > cpd-base.xml 2>/dev/null || true
+        npx jscpd@4 --pattern "${{ inputs.jscpd-file-pattern }}" --ignore "${{ inputs.jscpd-ignore-pattern }}" --reporters json --output jscpd-base --min-lines ${{ inputs.jscpd-min-lines }} --min-tokens ${{ inputs.jscpd-min-tokens }} 2>/dev/null || true
+        git checkout ${{ github.sha }} --quiet
+
+    - name: Run both engines on PR branch
+      shell: bash
+      run: |
+        pmd cpd --dir ${{ inputs.directories }} --language ${{ inputs.cpd-language }} --minimum-tokens ${{ inputs.cpd-min-tokens }} --format xml > cpd-pr.xml || true
+        npx jscpd@4 --pattern "${{ inputs.jscpd-file-pattern }}" --ignore "${{ inputs.jscpd-ignore-pattern }}" --reporters consoleFull,json --output jscpd-report --min-lines ${{ inputs.jscpd-min-lines }} --min-tokens ${{ inputs.jscpd-min-tokens }} || true
+
+    - name: Install xml2js for report script
+      shell: bash
+      working-directory: ${{ github.action_path }}
+      run: npm install --no-save xml2js
+
+    - name: Generate combined duplicate report
+      uses: actions/github-script@v7
+      env:
+        INPUT_DIRECTORIES: ${{ inputs.directories }}
+        INPUT_FILE_EXTENSIONS: ${{ inputs.file-extensions }}
+        INPUT_CPD_MAX_PCT: ${{ inputs.cpd-max-duplication }}
+        INPUT_CPD_MAX_INCREASE: ${{ inputs.cpd-max-increase }}
+        INPUT_JSCPD_MAX_PCT: ${{ inputs.jscpd-max-duplication }}
+        INPUT_JSCPD_MAX_INCREASE: ${{ inputs.jscpd-max-increase }}
+        NODE_PATH: ${{ github.action_path }}/node_modules
+      with:
+        github-token: ${{ inputs.github-token }}
+        script: |
+          const { analyzeAndReport } = require('${{ github.action_path }}/report.js');
+          await analyzeAndReport({ github, context, core });

@@ -1,0 +1,25 @@
+name: Self-test
+
+on:
+  pull_request:
+  push:
+    branches: [ main ]
+
+jobs:
+  self-test:
+    runs-on: ubuntu-latest
+    if: github.event_name == 'pull_request'
+    permissions:
+      contents: read
+      pull-requests: write
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+      - uses: ./
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          directories: '.'
+          file-extensions: 'js'
+          cpd-language: 'javascript'
+          jscpd-file-pattern: '**/*.js'
