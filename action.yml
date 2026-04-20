@@ -224,7 +224,7 @@ runs:
       run: npm install --no-save xml2js
 
     - name: Generate combined duplicate report
-      uses: actions/github-script@v7
+      uses: actions/github-script@v9
       env:
         INPUT_DIRECTORIES: ${{ inputs.directories }}
         INPUT_FILE_EXTENSIONS: ${{ env.RESOLVED_FILE_EXTENSIONS }}
