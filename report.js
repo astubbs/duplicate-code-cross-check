@@ -23,7 +23,6 @@
 const fs = require('fs');
 const crypto = require('crypto');
 const { execSync } = require('child_process');
-const path = require('path');
 
 function readConfig() {
   const parseFloatOr = (v, fallback) => {
@@ -299,4 +298,20 @@ async function analyzeAndReport({ github, context, core }) {
   }
 }
 
-module.exports = { analyzeAndReport };
+module.exports = {
+  analyzeAndReport,
+  // Exported for testing
+  readConfig,
+  contentHash,
+  relPath,
+  countTotalLines,
+  deltaEmoji,
+  fmtDelta,
+  parseCpdXml,
+  cpdStats,
+  cpdNewClones,
+  loadJscpd,
+  jscpdNewClones,
+  renderEngineSection,
+  checkFail,
+};
