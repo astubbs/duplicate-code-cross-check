@@ -55,6 +55,8 @@ Running both gives cross-validation. If both flag the same block, it's almost ce
 
 ### Minimal
 
+No language configuration needed - the action auto-detects from your source files:
+
 ```yaml
 name: PR Checks
 on: pull_request
@@ -75,7 +77,7 @@ jobs:
           directories: src
 ```
 
-### Full configuration
+### Full configuration (overrides auto-detection)
 
 ```yaml
       - uses: astubbs/duplicate-code-cross-check@v1
@@ -96,19 +98,29 @@ jobs:
           pmd-version: '7.9.0'
 ```
 
+## Language auto-detection
+
+By default, all three language-sensitive inputs (`cpd-language`, `jscpd-file-pattern`, `file-extensions`) are set to `auto`. The action scans your configured directories, counts files by extension, and:
+
+- **CPD language** - picks the dominant language (the one with the most source files). File counts are aggregated per language, so `.ts` + `.tsx` files both count toward `typescript`. If no CPD-supported language is found (e.g., a pure Astro project), CPD is skipped and only jscpd runs.
+- **jscpd file pattern** - includes all detected source extensions, not just the dominant one, since jscpd is language-agnostic.
+- **file-extensions** - includes all detected extensions for accurate line-count percentage calculation.
+
+Each input is resolved independently. You can override one while leaving the others on `auto` - for example, set `cpd-language: python` explicitly while letting jscpd pattern auto-detect.
+
 ## Inputs
 
 | Input | Required | Default | Purpose |
 |-------|----------|---------|---------|
 | `github-token` | yes | - | Token for posting PR comments and review annotations |
 | `directories` | yes | - | Space-separated directories to scan |
-| `file-extensions` | no | `java` | Extensions (comma-separated) used to count total lines for percentage |
-| `cpd-language` | no | `java` | PMD CPD language (see [PMD docs](https://pmd.github.io/pmd/pmd_userdocs_cpd.html) for supported languages) |
+| `file-extensions` | no | `auto` | Extensions (comma-separated) for line-count percentage, or `auto` to detect |
+| `cpd-language` | no | `auto` | PMD CPD language (see [PMD docs](https://pmd.github.io/pmd/pmd_userdocs_cpd.html)), or `auto` to detect |
 | `cpd-min-tokens` | no | `70` | Minimum tokens before PMD CPD flags a clone |
 | `cpd-max-duplication` | no | `5` | PMD CPD fails if total duplication exceeds this % |
 | `cpd-max-increase` | no | `0.1` | PMD CPD fails if duplication grows by more than this % vs base |
-| `jscpd-file-pattern` | no | `**/*.java` | jscpd glob for files to scan |
-| `jscpd-ignore-pattern` | no | `**/target/**,**/node_modules/**,**/build/**,**/dist/**` | jscpd comma-separated ignore patterns |
+| `jscpd-file-pattern` | no | `auto` | jscpd glob for files to scan, or `auto` to detect |
+| `jscpd-ignore-pattern` | no | `**/target/**,**/node_modules/**,**/build/**,**/dist/**,**/__pycache__/**,**/vendor/**,**/.venv/**,**/.next/**,**/.output/**,**/.nuxt/**,**/*.egg-info/**,**/out/**,**/.git/**` | jscpd comma-separated ignore patterns |
 | `jscpd-min-lines` | no | `6` | Minimum lines before jscpd flags a clone |
 | `jscpd-min-tokens` | no | `70` | Minimum tokens before jscpd flags a clone |
 | `jscpd-max-duplication` | no | `4` | jscpd fails if total duplication exceeds this % |
