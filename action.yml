@@ -13,13 +13,13 @@ inputs:
     description: 'Space-separated list of directories to scan'
     required: true
   file-extensions:
-    description: 'Comma-separated list of file extensions to count for percentage calculation'
+    description: 'Comma-separated file extensions for percentage calculation (or "auto" to detect from files)'
     required: false
-    default: 'java'
+    default: 'auto'
   cpd-language:
-    description: 'PMD CPD language (java, python, kotlin, cpp, csharp, go, javascript, ruby, scala, etc.)'
+    description: 'PMD CPD language - java, python, kotlin, cpp, csharp, go, javascript, typescript, ruby, scala, etc. (or "auto" to detect from files)'
     required: false
-    default: 'java'
+    default: 'auto'
   cpd-min-tokens:
     description: 'PMD CPD minimum token count to flag as a clone'
     required: false
@@ -33,13 +33,13 @@ inputs:
     required: false
     default: '0.1'
   jscpd-file-pattern:
-    description: 'jscpd glob pattern for files to scan'
+    description: 'jscpd glob pattern for files to scan (or "auto" to detect from files)'
     required: false
-    default: '**/*.java'
+    default: 'auto'
   jscpd-ignore-pattern:
     description: 'jscpd comma-separated glob patterns to ignore'
     required: false
-    default: '**/target/**,**/node_modules/**,**/build/**,**/dist/**'
+    default: '**/target/**,**/node_modules/**,**/build/**,**/dist/**,**/__pycache__/**,**/vendor/**,**/.venv/**,**/.next/**,**/.output/**,**/.nuxt/**,**/*.egg-info/**,**/out/**,**/.git/**'
   jscpd-min-lines:
     description: 'jscpd minimum line count to flag as a clone'
     required: false
@@ -82,19 +82,141 @@ runs:
         unzip -q "pmd-dist-${{ inputs.pmd-version }}-bin.zip"
         echo "$PWD/pmd-bin-${{ inputs.pmd-version }}/bin" >> $GITHUB_PATH
 
+    - name: Auto-detect language from source files
+      id: detect
+      shell: bash
+      run: |
+        # Map file extensions to PMD CPD language identifiers.
+        # Multiple extensions can map to the same language; counts are aggregated.
+        ext_to_cpd_lang() {
+          case "$1" in
+            java)                  echo "java" ;;
+            js|jsx|mjs|cjs)        echo "javascript" ;;
+            ts|tsx|mts|cts)        echo "typescript" ;;
+            py|pyw)                echo "python" ;;
+            kt|kts)                echo "kotlin" ;;
+            cpp|cc|cxx|hpp|h|c)    echo "cpp" ;;
+            cs)                    echo "csharp" ;;
+            go)                    echo "go" ;;
+            rb)                    echo "ruby" ;;
+            scala|sc)              echo "scala" ;;
+            swift)                 echo "swift" ;;
+            lua)                   echo "lua" ;;
+            m)                     echo "objectivec" ;;
+            groovy|gvy)            echo "groovy" ;;
+            xml|xsl|xslt|wsdl)    echo "xml" ;;
+            pl|pm)                 echo "perl" ;;
+            php)                   echo "php" ;;
+            rs)                    echo "rust" ;;
+            *)                     echo "" ;;
+          esac
+        }
+
+        DIRS="${{ inputs.directories }}"
+        INPUT_CPD_LANG="${{ inputs.cpd-language }}"
+        INPUT_JSCPD_PATTERN="${{ inputs.jscpd-file-pattern }}"
+        INPUT_FILE_EXT="${{ inputs.file-extensions }}"
+
+        NEED_SCAN="false"
+        if [[ "$INPUT_CPD_LANG" == "auto" ]] || [[ "$INPUT_JSCPD_PATTERN" == "auto" ]] || [[ "$INPUT_FILE_EXT" == "auto" ]]; then
+          NEED_SCAN="true"
+        fi
+
+        if [[ "$NEED_SCAN" == "true" ]]; then
+          echo "::group::Auto-detecting language from files in: $DIRS"
+
+          # Count files by extension, excluding common non-source directories
+          declare -A LANG_COUNTS
+          ALL_EXTENSIONS=()
+
+          while IFS= read -r line; do
+            count=$(echo "$line" | awk '{print $1}')
+            ext=$(echo "$line" | awk '{print $2}')
+            if [[ -n "$ext" ]]; then
+              ALL_EXTENSIONS+=("$ext")
+              lang=$(ext_to_cpd_lang "$ext")
+              if [[ -n "$lang" ]]; then
+                LANG_COUNTS[$lang]=$(( ${LANG_COUNTS[$lang]:-0} + count ))
+              fi
+            fi
+          done < <(find $DIRS -type f -not -path '*/.git/*' -not -path '*/node_modules/*' -not -path '*/vendor/*' -not -path '*/__pycache__/*' -not -path '*/.venv/*' 2>/dev/null | grep '\.' | sed 's/.*\.//' | sort | uniq -c | sort -rn)
+
+          # Pick dominant CPD language (highest count, alphabetical tiebreak)
+          BEST_LANG=""
+          BEST_COUNT=0
+          for lang in $(echo "${!LANG_COUNTS[@]}" | tr ' ' '\n' | sort); do
+            count=${LANG_COUNTS[$lang]}
+            if (( count > BEST_COUNT )); then
+              BEST_COUNT=$count
+              BEST_LANG=$lang
+            fi
+          done
+
+          # Build jscpd glob from all detected extensions
+          if [[ ${#ALL_EXTENSIONS[@]} -eq 1 ]]; then
+            DETECTED_JSCPD_PATTERN="**/*.${ALL_EXTENSIONS[0]}"
+          elif [[ ${#ALL_EXTENSIONS[@]} -gt 1 ]]; then
+            EXT_LIST=$(IFS=,; echo "${ALL_EXTENSIONS[*]}")
+            DETECTED_JSCPD_PATTERN="**/*.{${EXT_LIST}}"
+          else
+            DETECTED_JSCPD_PATTERN=""
+          fi
+
+          # Build file-extensions list
+          DETECTED_FILE_EXT=$(IFS=,; echo "${ALL_EXTENSIONS[*]}")
+
+          echo "Detected extensions: ${ALL_EXTENSIONS[*]}"
+          echo "Detected CPD language: ${BEST_LANG:-<none>} (${BEST_COUNT} files)"
+          echo "Detected jscpd pattern: ${DETECTED_JSCPD_PATTERN}"
+          echo "Detected file-extensions: ${DETECTED_FILE_EXT}"
+
+          if [[ -z "$BEST_LANG" ]]; then
+            echo "::warning::No PMD CPD-supported language detected in scanned directories. CPD will be skipped."
+          fi
+
+          echo "::endgroup::"
+        fi
+
+        # Resolve each input: use detected value if 'auto', otherwise use explicit value
+        if [[ "$INPUT_CPD_LANG" == "auto" ]]; then
+          echo "RESOLVED_CPD_LANGUAGE=${BEST_LANG:-}" >> $GITHUB_ENV
+        else
+          echo "RESOLVED_CPD_LANGUAGE=${INPUT_CPD_LANG}" >> $GITHUB_ENV
+        fi
+
+        if [[ "$INPUT_JSCPD_PATTERN" == "auto" ]]; then
+          echo "RESOLVED_JSCPD_PATTERN=${DETECTED_JSCPD_PATTERN:-}" >> $GITHUB_ENV
+        else
+          echo "RESOLVED_JSCPD_PATTERN=${INPUT_JSCPD_PATTERN}" >> $GITHUB_ENV
+        fi
+
+        if [[ "$INPUT_FILE_EXT" == "auto" ]]; then
+          echo "RESOLVED_FILE_EXTENSIONS=${DETECTED_FILE_EXT:-}" >> $GITHUB_ENV
+        else
+          echo "RESOLVED_FILE_EXTENSIONS=${INPUT_FILE_EXT}" >> $GITHUB_ENV
+        fi
+
     - name: Run both engines on base branch
       shell: bash
       run: |
         git checkout ${{ github.event.pull_request.base.sha }} --quiet 2>/dev/null || true
-        pmd cpd --dir ${{ inputs.directories }} --language ${{ inputs.cpd-language }} --minimum-tokens ${{ inputs.cpd-min-tokens }} --format xml > cpd-base.xml 2>/dev/null || true
-        npx jscpd@4 --pattern "${{ inputs.jscpd-file-pattern }}" --ignore "${{ inputs.jscpd-ignore-pattern }}" --reporters json --output jscpd-base --min-lines ${{ inputs.jscpd-min-lines }} --min-tokens ${{ inputs.jscpd-min-tokens }} 2>/dev/null || true
+        if [[ -n "$RESOLVED_CPD_LANGUAGE" ]]; then
+          pmd cpd --dir ${{ inputs.directories }} --language "$RESOLVED_CPD_LANGUAGE" --minimum-tokens ${{ inputs.cpd-min-tokens }} --format xml > cpd-base.xml 2>/dev/null || true
+        else
+          echo "Skipping CPD on base branch (no supported language detected)"
+        fi
+        npx jscpd@4 --pattern "$RESOLVED_JSCPD_PATTERN" --ignore "${{ inputs.jscpd-ignore-pattern }}" --reporters json --output jscpd-base --min-lines ${{ inputs.jscpd-min-lines }} --min-tokens ${{ inputs.jscpd-min-tokens }} 2>/dev/null || true
         git checkout ${{ github.sha }} --quiet
 
     - name: Run both engines on PR branch
       shell: bash
       run: |
-        pmd cpd --dir ${{ inputs.directories }} --language ${{ inputs.cpd-language }} --minimum-tokens ${{ inputs.cpd-min-tokens }} --format xml > cpd-pr.xml || true
-        npx jscpd@4 --pattern "${{ inputs.jscpd-file-pattern }}" --ignore "${{ inputs.jscpd-ignore-pattern }}" --reporters consoleFull,json --output jscpd-report --min-lines ${{ inputs.jscpd-min-lines }} --min-tokens ${{ inputs.jscpd-min-tokens }} || true
+        if [[ -n "$RESOLVED_CPD_LANGUAGE" ]]; then
+          pmd cpd --dir ${{ inputs.directories }} --language "$RESOLVED_CPD_LANGUAGE" --minimum-tokens ${{ inputs.cpd-min-tokens }} --format xml > cpd-pr.xml || true
+        else
+          echo "Skipping CPD on PR branch (no supported language detected)"
+        fi
+        npx jscpd@4 --pattern "$RESOLVED_JSCPD_PATTERN" --ignore "${{ inputs.jscpd-ignore-pattern }}" --reporters consoleFull,json --output jscpd-report --min-lines ${{ inputs.jscpd-min-lines }} --min-tokens ${{ inputs.jscpd-min-tokens }} || true
 
     - name: Install xml2js for report script
       shell: bash
@@ -105,7 +227,7 @@ runs:
       uses: actions/github-script@v7
       env:
         INPUT_DIRECTORIES: ${{ inputs.directories }}
-        INPUT_FILE_EXTENSIONS: ${{ inputs.file-extensions }}
+        INPUT_FILE_EXTENSIONS: ${{ env.RESOLVED_FILE_EXTENSIONS }}
         INPUT_CPD_MAX_PCT: ${{ inputs.cpd-max-duplication }}
         INPUT_CPD_MAX_INCREASE: ${{ inputs.cpd-max-increase }}
         INPUT_JSCPD_MAX_PCT: ${{ inputs.jscpd-max-duplication }}

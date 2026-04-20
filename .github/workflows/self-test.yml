@@ -20,6 +20,3 @@ jobs:
         with:
           github-token: ${{ secrets.GITHUB_TOKEN }}
           directories: '.'
-          file-extensions: 'js'
-          cpd-language: 'javascript'
-          jscpd-file-pattern: '**/*.js'

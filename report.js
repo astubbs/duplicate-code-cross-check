@@ -32,7 +32,7 @@ function readConfig() {
   };
   return {
     directories: (process.env.INPUT_DIRECTORIES || '.').split(/\s+/).filter(Boolean),
-    fileExtensions: (process.env.INPUT_FILE_EXTENSIONS || 'java').split(',').map(e => e.trim()).filter(Boolean),
+    fileExtensions: (process.env.INPUT_FILE_EXTENSIONS || '').split(',').map(e => e.trim()).filter(Boolean),
     thresholds: {
       cpd:   { maxPct: parseFloatOr(process.env.INPUT_CPD_MAX_PCT, 5),    maxIncrease: parseFloatOr(process.env.INPUT_CPD_MAX_INCREASE, 0.1) },
       jscpd: { maxPct: parseFloatOr(process.env.INPUT_JSCPD_MAX_PCT, 4), maxIncrease: parseFloatOr(process.env.INPUT_JSCPD_MAX_INCREASE, 0.1) },
@@ -227,7 +227,7 @@ async function analyzeAndReport({ github, context, core }) {
       const locations = d.files.map(f => `\`${makeRel(f.name)}:${f.startLine}\``).join(' <-> ');
       return `- **${d.lines} lines** (${d.tokens} tokens): ${locations}\n`;
     };
-    body += renderEngineSection('PMD CPD (Java-aware)', cpdPrStats, cpdBaseStats, cpdNew, formatClone, cpdCheck, config.thresholds.cpd);
+    body += renderEngineSection('PMD CPD', cpdPrStats, cpdBaseStats, cpdNew, formatClone, cpdCheck, config.thresholds.cpd);
   } else {
     body += `### :question: PMD CPD\n\nNo report available.\n\n`;
   }
