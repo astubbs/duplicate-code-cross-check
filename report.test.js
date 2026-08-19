@@ -18,6 +18,7 @@ const {
   jscpdNewClones,
   checkFail,
   renderEngineSection,
+  annotateNewClones,
 } = require('./report.js');
 
 // ── contentHash ──────────────────────────────────────────────────────
@@ -430,5 +431,75 @@ describe('renderEngineSection', () => {
     const thresholds = { maxPct: 5, maxIncrease: 0.1 };
     const md = renderEngineSection('Test Engine', prStats, null, [], () => '', check, thresholds);
     assert.ok(md.includes('no base'));
+  });
+});
+
+// ── annotateNewClones ────────────────────────────────────────────────
+
+describe('annotateNewClones', () => {
+  const context = { repo: { owner: 'astubbs', repo: 'demo' }, issue: { number: 31 }, sha: 'abc123' };
+  const makeRel = (p) => relPath(p, '/ws');
+  const clones = [{
+    lines: 12,
+    files: [
+      { name: '/ws/src/Changed.java', startLine: 41 },
+      { name: '/ws/src/Other.java', startLine: 7 },
+    ],
+  }];
+  const expectedBody = ':warning: **Duplicate code detected** - 12 lines duplicated with `src/Other.java:7`';
+
+  // Minimal stand-in for the github-script `github` object: records the
+  // createReviewComment calls, and serves `existingComments` through
+  // `paginate` so a comment beyond the first API page is still seen.
+  const fakeGithub = (existingComments) => {
+    const created = [];
+    const listReviewComments = () => { throw new Error('must be called through paginate'); };
+    return {
+      created,
+      paginate: async (fn, _params) => {
+        assert.equal(fn, listReviewComments, 'should paginate over listReviewComments');
+        return existingComments;
+      },
+      rest: {
+        pulls: {
+          listFiles: async () => ({ data: [{ filename: 'src/Changed.java' }] }),
+          listReviewComments,
+          createReviewComment: async (params) => { created.push(params); },
+        },
+      },
+    };
+  };
+
+  it('does not re-post a comment that already exists at the same path and body', async () => {
+    const github = fakeGithub([{ path: 'src/Changed.java', body: expectedBody }]);
+    await annotateNewClones({ github, context, clones, makeRel });
+    assert.deepEqual(github.created, []);
+  });
+
+  it('posts when no matching comment exists', async () => {
+    const github = fakeGithub([{ path: 'src/Unrelated.java', body: 'some other review comment' }]);
+    await annotateNewClones({ github, context, clones, makeRel });
+    assert.equal(github.created.length, 1);
+    assert.equal(github.created[0].path, 'src/Changed.java');
+    assert.equal(github.created[0].line, 41);
+    assert.equal(github.created[0].body, expectedBody);
+  });
+
+  it('posts when the PR has no review comments at all', async () => {
+    const github = fakeGithub([]);
+    await annotateNewClones({ github, context, clones, makeRel });
+    assert.equal(github.created.length, 1);
+  });
+
+  it('does not post twice for the same finding within one run', async () => {
+    const github = fakeGithub([]);
+    await annotateNewClones({ github, context, clones: [clones[0], clones[0]], makeRel });
+    assert.equal(github.created.length, 1);
+  });
+
+  it('does nothing when there are no new clones', async () => {
+    const github = fakeGithub([]);
+    await annotateNewClones({ github, context, clones: [], makeRel });
+    assert.deepEqual(github.created, []);
   });
 });

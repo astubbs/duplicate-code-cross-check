@@ -48,7 +48,9 @@ Running both gives cross-validation. If both flag the same block, it's almost ce
   - Delta vs the base branch (with emoji reactions based on magnitude)
   - Pass / fail status against your configured thresholds
   - Collapsible list of new clones introduced by this PR
-- **Inline PR review comments** on the diff, pointing at specific lines of new duplication
+- **Inline PR review comments** on the diff, pointing at specific lines of new duplication - posted
+  once per finding, so a re-run on the next push does not open a second thread for it (including
+  findings whose thread you have already resolved)
 - **CI failure** if any engine's duplication exceeds the ceiling or increases vs base
 
 ## Usage

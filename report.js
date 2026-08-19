@@ -184,6 +184,79 @@ function checkFail(stats, baseStats, thresholds) {
   return { shouldFail: pctFail || increaseFail, pctFail, increaseFail, pctDelta };
 }
 
+// ── PR annotation ─────────────────────────────────────────────────────
+
+/**
+ * Post inline review comments for new clones that land on changed lines.
+ *
+ * Idempotent by design: the action re-runs on every push, so an unguarded
+ * create call opens a brand new review thread for the same finding at the
+ * same anchor, forever - astubbs/parallel-consumer#31 accumulated 25 such
+ * threads, 24 of them at one identical anchor with byte-identical bodies.
+ * Each unresolved thread blocks merge on "unresolved conversations", so every
+ * duplicate had to be replied to and resolved by hand.
+ *
+ * The existing comments are fetched ONCE before the loop, and paginated: that
+ * PR had 25+ review comments, so reading only the first page would miss
+ * existing ones and re-post anyway.
+ *
+ * NOTE: listReviewComments still returns a comment whose thread has been
+ * RESOLVED, and that is exactly what we want here - a finding the author has
+ * already resolved must not be posted again. Do not "fix" this by filtering
+ * resolved threads back out.
+ */
+async function annotateNewClones({ github, context, clones, makeRel }) {
+  if (!clones || clones.length === 0) return;
+
+  const { data: files } = await github.rest.pulls.listFiles({
+    owner: context.repo.owner, repo: context.repo.repo, pull_number: context.issue.number
+  });
+  const changedFiles = new Set(files.map(f => f.filename));
+
+  let existing;
+  try {
+    existing = await github.paginate(github.rest.pulls.listReviewComments, {
+      owner: context.repo.owner, repo: context.repo.repo, pull_number: context.issue.number, per_page: 100
+    });
+  } catch (e) {
+    // Without the existing list there is no way to tell a new finding from one
+    // already posted, so skip annotating rather than re-post every finding.
+    console.log(`Could not list existing review comments, skipping annotations - ${e.message}`);
+    return;
+  }
+  const key = (path, body) => `${path}\n${body}`;
+  const alreadyPosted = new Set((existing || []).map(c => key(c.path, c.body)));
+
+  for (const d of clones.slice(0, 10)) {
+    for (const file of d.files) {
+      const relFile = makeRel(file.name);
+      if (changedFiles.has(relFile)) {
+        const others = d.files.filter(f => f !== file).map(f => `${makeRel(f.name)}:${f.startLine}`).join(', ');
+        const body = `:warning: **Duplicate code detected** - ${d.lines} lines duplicated with \`${others}\``;
+        if (alreadyPosted.has(key(relFile, body))) {
+          console.log(`Already commented on ${relFile}:${file.startLine} - skipping`);
+          break;
+        }
+        try {
+          await github.rest.pulls.createReviewComment({
+            owner: context.repo.owner,
+            repo: context.repo.repo,
+            pull_number: context.issue.number,
+            commit_id: context.sha,
+            path: relFile,
+            line: file.startLine,
+            body
+          });
+          alreadyPosted.add(key(relFile, body));
+        } catch (e) {
+          console.log(`Could not annotate ${relFile}:${file.startLine} - ${e.message}`);
+        }
+        break;
+      }
+    }
+  }
+}
+
 // ── Main entrypoint ───────────────────────────────────────────────────
 
 async function analyzeAndReport({ github, context, core }) {
@@ -260,35 +333,7 @@ async function analyzeAndReport({ github, context, core }) {
   }
 
   // Annotate new CPD clones on PR diff (CPD preferred for accuracy)
-  const annotateClones = cpdNew.length > 0 ? cpdNew : [];
-  if (annotateClones.length > 0) {
-    const { data: files } = await github.rest.pulls.listFiles({
-      owner: context.repo.owner, repo: context.repo.repo, pull_number: context.issue.number
-    });
-    const changedFiles = new Set(files.map(f => f.filename));
-    for (const d of annotateClones.slice(0, 10)) {
-      for (const file of d.files) {
-        const relFile = makeRel(file.name);
-        if (changedFiles.has(relFile)) {
-          const others = d.files.filter(f => f !== file).map(f => `${makeRel(f.name)}:${f.startLine}`).join(', ');
-          try {
-            await github.rest.pulls.createReviewComment({
-              owner: context.repo.owner,
-              repo: context.repo.repo,
-              pull_number: context.issue.number,
-              commit_id: context.sha,
-              path: relFile,
-              line: file.startLine,
-              body: `:warning: **Duplicate code detected** - ${d.lines} lines duplicated with \`${others}\``
-            });
-          } catch (e) {
-            console.log(`Could not annotate ${relFile}:${file.startLine} - ${e.message}`);
-          }
-          break;
-        }
-      }
-    }
-  }
+  await annotateNewClones({ github, context, clones: cpdNew, makeRel });
 
   if (anyFail) {
     const msgs = [];
@@ -314,4 +359,5 @@ module.exports = {
   jscpdNewClones,
   renderEngineSection,
   checkFail,
+  annotateNewClones,
 };
