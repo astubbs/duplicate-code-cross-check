@@ -21,8 +21,8 @@
  *   GITHUB_WORKSPACE          - stripped from file paths in output
  */
 const fs = require('fs');
+const path = require('path');
 const crypto = require('crypto');
-const { execSync } = require('child_process');
 
 function readConfig() {
   const parseFloatOr = (v, fallback) => {
@@ -53,15 +53,52 @@ function relPath(p, workspace) {
   return p;
 }
 
+/**
+ * Total newline count across files under `dirs` matching any of `extensions`.
+ *
+ * Deliberately does NOT shell out. This previously built a `find ... | xargs wc -l`
+ * pipeline by string concatenation and ran it through bash, which meant a directory
+ * name or extension containing shell metacharacters was executed rather than matched
+ * (CodeQL: "Unsafe shell command constructed from library input"). Those values come
+ * from the action's `directories` / `file_extensions` inputs, so a consumer of this
+ * action templating a dynamic value into either one had command injection, and an
+ * ordinary path containing a space silently produced a wrong count.
+ *
+ * Semantics are matched to the pipeline it replaces: `wc -l` counts NEWLINES, so a
+ * final line with no trailing newline is not counted, and symlinks are skipped
+ * because `find -type f` excludes them. Unreadable entries are skipped rather than
+ * failing the whole count, which is what `2>/dev/null` did.
+ */
 function countTotalLines(dirs, extensions) {
-  try {
-    const extArgs = extensions.map(e => `-name '*.${e}'`).join(' -o ');
-    const cmd = `find ${dirs.join(' ')} -type f \\( ${extArgs} \\) 2>/dev/null | xargs wc -l 2>/dev/null | tail -1 | awk '{print $1}'`;
-    const result = execSync(cmd, { encoding: 'utf8', shell: '/bin/bash' });
-    return parseInt(result.trim()) || 0;
-  } catch {
-    return 0;
-  }
+  if (!dirs || !extensions || extensions.length === 0) return 0;
+  const suffixes = extensions.map(e => `.${e}`);
+  let total = 0;
+
+  const walk = (dir) => {
+    let entries;
+    try {
+      entries = fs.readdirSync(dir, { withFileTypes: true });
+    } catch {
+      return; // unreadable or missing - the old pipeline swallowed these too
+    }
+    for (const entry of entries) {
+      const full = path.join(dir, entry.name);
+      if (entry.isSymbolicLink()) continue; // `find -type f` does not match symlinks
+      if (entry.isDirectory()) {
+        walk(full);
+      } else if (entry.isFile() && suffixes.some(sfx => entry.name.endsWith(sfx))) {
+        try {
+          const buf = fs.readFileSync(full);
+          for (let i = 0; i < buf.length; i++) if (buf[i] === 0x0a) total++;
+        } catch {
+          // skip a file we cannot read, as before
+        }
+      }
+    }
+  };
+
+  for (const dir of dirs) walk(dir);
+  return total;
 }
 
 function deltaEmoji(d, isPercentage) {

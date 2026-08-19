@@ -1,4 +1,4 @@
-const { describe, it, before, after } = require('node:test');
+const { describe, it, before, after, beforeEach, afterEach } = require('node:test');
 const assert = require('node:assert/strict');
 const fs = require('fs');
 const path = require('path');
@@ -396,6 +396,63 @@ describe('countTotalLines', () => {
   it('counts lines in current directory for js files', () => {
     const lines = countTotalLines(['.'], ['js']);
     assert.ok(lines > 0, `Expected positive line count, got ${lines}`);
+  });
+
+  // The following pin the behaviour that the `find ... | xargs wc -l` pipeline got
+  // wrong. They are regression tests for a real miscount, not just for the injection.
+  describe('paths the old shell pipeline mishandled', () => {
+    const os = require('os');
+    const fsx = require('fs');
+    const pathx = require('path');
+    let root;
+
+    beforeEach(() => {
+      root = fsx.mkdtempSync(pathx.join(os.tmpdir(), 'ctl-'));
+    });
+    afterEach(() => {
+      fsx.rmSync(root, { recursive: true, force: true });
+    });
+
+    it('counts files under a directory whose name contains a space', () => {
+      // xargs split this path on the space, so both halves missed and the file
+      // contributed ZERO to the total. Silently wrong, never an error.
+      const dir = pathx.join(root, 'a dir');
+      fsx.mkdirSync(dir);
+      fsx.writeFileSync(pathx.join(dir, 'one.js'), 'x\ny\nz\n');
+      assert.equal(countTotalLines([root], ['js']), 3);
+    });
+
+    it('does not execute shell metacharacters in a directory name', () => {
+      const dir = pathx.join(root, 'x; touch pwned');
+      fsx.mkdirSync(dir);
+      fsx.writeFileSync(pathx.join(dir, 'one.js'), 'a\n');
+      assert.equal(countTotalLines([root], ['js']), 1);
+      assert.ok(!fsx.existsSync(pathx.join(process.cwd(), 'pwned')), 'metacharacters must not reach a shell');
+    });
+
+    it('does not execute shell metacharacters in an extension', () => {
+      fsx.writeFileSync(pathx.join(root, 'one.js'), 'a\n');
+      assert.equal(countTotalLines([root], ['js; touch pwned2']), 0);
+      assert.ok(!fsx.existsSync(pathx.join(process.cwd(), 'pwned2')), 'metacharacters must not reach a shell');
+    });
+
+    it('counts newlines, so a final line without one is not counted', () => {
+      fsx.writeFileSync(pathx.join(root, 'one.js'), 'p\nq');
+      assert.equal(countTotalLines([root], ['js']), 1);
+    });
+
+    it('skips symlinks, matching `find -type f`', () => {
+      fsx.writeFileSync(pathx.join(root, 'real.js'), 'a\nb\n');
+      fsx.symlinkSync(pathx.join(root, 'real.js'), pathx.join(root, 'link.js'));
+      assert.equal(countTotalLines([root], ['js']), 2);
+    });
+
+    it('recurses into nested directories', () => {
+      const deep = pathx.join(root, 'a', 'b', 'c');
+      fsx.mkdirSync(deep, { recursive: true });
+      fsx.writeFileSync(pathx.join(deep, 'deep.js'), 'a\nb\nc\n');
+      assert.equal(countTotalLines([root], ['js']), 3);
+    });
   });
 });
 
