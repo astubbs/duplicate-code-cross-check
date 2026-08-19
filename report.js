@@ -21,8 +21,8 @@
  *   GITHUB_WORKSPACE          - stripped from file paths in output
  */
 const fs = require('fs');
+const path = require('path');
 const crypto = require('crypto');
-const { execSync } = require('child_process');
 
 function readConfig() {
   const parseFloatOr = (v, fallback) => {
@@ -53,15 +53,52 @@ function relPath(p, workspace) {
   return p;
 }
 
+/**
+ * Total newline count across files under `dirs` matching any of `extensions`.
+ *
+ * Deliberately does NOT shell out. This previously built a `find ... | xargs wc -l`
+ * pipeline by string concatenation and ran it through bash, which meant a directory
+ * name or extension containing shell metacharacters was executed rather than matched
+ * (CodeQL: "Unsafe shell command constructed from library input"). Those values come
+ * from the action's `directories` / `file_extensions` inputs, so a consumer of this
+ * action templating a dynamic value into either one had command injection, and an
+ * ordinary path containing a space silently produced a wrong count.
+ *
+ * Semantics are matched to the pipeline it replaces: `wc -l` counts NEWLINES, so a
+ * final line with no trailing newline is not counted, and symlinks are skipped
+ * because `find -type f` excludes them. Unreadable entries are skipped rather than
+ * failing the whole count, which is what `2>/dev/null` did.
+ */
 function countTotalLines(dirs, extensions) {
-  try {
-    const extArgs = extensions.map(e => `-name '*.${e}'`).join(' -o ');
-    const cmd = `find ${dirs.join(' ')} -type f \\( ${extArgs} \\) 2>/dev/null | xargs wc -l 2>/dev/null | tail -1 | awk '{print $1}'`;
-    const result = execSync(cmd, { encoding: 'utf8', shell: '/bin/bash' });
-    return parseInt(result.trim()) || 0;
-  } catch {
-    return 0;
-  }
+  if (!dirs || !extensions || extensions.length === 0) return 0;
+  const suffixes = extensions.map(e => `.${e}`);
+  let total = 0;
+
+  const walk = (dir) => {
+    let entries;
+    try {
+      entries = fs.readdirSync(dir, { withFileTypes: true });
+    } catch {
+      return; // unreadable or missing - the old pipeline swallowed these too
+    }
+    for (const entry of entries) {
+      const full = path.join(dir, entry.name);
+      if (entry.isSymbolicLink()) continue; // `find -type f` does not match symlinks
+      if (entry.isDirectory()) {
+        walk(full);
+      } else if (entry.isFile() && suffixes.some(sfx => entry.name.endsWith(sfx))) {
+        try {
+          const buf = fs.readFileSync(full);
+          for (let i = 0; i < buf.length; i++) if (buf[i] === 0x0a) total++;
+        } catch {
+          // skip a file we cannot read, as before
+        }
+      }
+    }
+  };
+
+  for (const dir of dirs) walk(dir);
+  return total;
 }
 
 function deltaEmoji(d, isPercentage) {
@@ -184,6 +221,79 @@ function checkFail(stats, baseStats, thresholds) {
   return { shouldFail: pctFail || increaseFail, pctFail, increaseFail, pctDelta };
 }
 
+// ── PR annotation ─────────────────────────────────────────────────────
+
+/**
+ * Post inline review comments for new clones that land on changed lines.
+ *
+ * Idempotent by design: the action re-runs on every push, so an unguarded
+ * create call opens a brand new review thread for the same finding at the
+ * same anchor, forever - astubbs/parallel-consumer#31 accumulated 25 such
+ * threads, 24 of them at one identical anchor with byte-identical bodies.
+ * Each unresolved thread blocks merge on "unresolved conversations", so every
+ * duplicate had to be replied to and resolved by hand.
+ *
+ * The existing comments are fetched ONCE before the loop, and paginated: that
+ * PR had 25+ review comments, so reading only the first page would miss
+ * existing ones and re-post anyway.
+ *
+ * NOTE: listReviewComments still returns a comment whose thread has been
+ * RESOLVED, and that is exactly what we want here - a finding the author has
+ * already resolved must not be posted again. Do not "fix" this by filtering
+ * resolved threads back out.
+ */
+async function annotateNewClones({ github, context, clones, makeRel }) {
+  if (!clones || clones.length === 0) return;
+
+  const { data: files } = await github.rest.pulls.listFiles({
+    owner: context.repo.owner, repo: context.repo.repo, pull_number: context.issue.number
+  });
+  const changedFiles = new Set(files.map(f => f.filename));
+
+  let existing;
+  try {
+    existing = await github.paginate(github.rest.pulls.listReviewComments, {
+      owner: context.repo.owner, repo: context.repo.repo, pull_number: context.issue.number, per_page: 100
+    });
+  } catch (e) {
+    // Without the existing list there is no way to tell a new finding from one
+    // already posted, so skip annotating rather than re-post every finding.
+    console.log(`Could not list existing review comments, skipping annotations - ${e.message}`);
+    return;
+  }
+  const key = (path, body) => `${path}\n${body}`;
+  const alreadyPosted = new Set((existing || []).map(c => key(c.path, c.body)));
+
+  for (const d of clones.slice(0, 10)) {
+    for (const file of d.files) {
+      const relFile = makeRel(file.name);
+      if (changedFiles.has(relFile)) {
+        const others = d.files.filter(f => f !== file).map(f => `${makeRel(f.name)}:${f.startLine}`).join(', ');
+        const body = `:warning: **Duplicate code detected** - ${d.lines} lines duplicated with \`${others}\``;
+        if (alreadyPosted.has(key(relFile, body))) {
+          console.log(`Already commented on ${relFile}:${file.startLine} - skipping`);
+          break;
+        }
+        try {
+          await github.rest.pulls.createReviewComment({
+            owner: context.repo.owner,
+            repo: context.repo.repo,
+            pull_number: context.issue.number,
+            commit_id: context.sha,
+            path: relFile,
+            line: file.startLine,
+            body
+          });
+          alreadyPosted.add(key(relFile, body));
+        } catch (e) {
+          console.log(`Could not annotate ${relFile}:${file.startLine} - ${e.message}`);
+        }
+        break;
+      }
+    }
+  }
+}
+
 // ── Main entrypoint ───────────────────────────────────────────────────
 
 async function analyzeAndReport({ github, context, core }) {
@@ -260,35 +370,7 @@ async function analyzeAndReport({ github, context, core }) {
   }
 
   // Annotate new CPD clones on PR diff (CPD preferred for accuracy)
-  const annotateClones = cpdNew.length > 0 ? cpdNew : [];
-  if (annotateClones.length > 0) {
-    const { data: files } = await github.rest.pulls.listFiles({
-      owner: context.repo.owner, repo: context.repo.repo, pull_number: context.issue.number
-    });
-    const changedFiles = new Set(files.map(f => f.filename));
-    for (const d of annotateClones.slice(0, 10)) {
-      for (const file of d.files) {
-        const relFile = makeRel(file.name);
-        if (changedFiles.has(relFile)) {
-          const others = d.files.filter(f => f !== file).map(f => `${makeRel(f.name)}:${f.startLine}`).join(', ');
-          try {
-            await github.rest.pulls.createReviewComment({
-              owner: context.repo.owner,
-              repo: context.repo.repo,
-              pull_number: context.issue.number,
-              commit_id: context.sha,
-              path: relFile,
-              line: file.startLine,
-              body: `:warning: **Duplicate code detected** - ${d.lines} lines duplicated with \`${others}\``
-            });
-          } catch (e) {
-            console.log(`Could not annotate ${relFile}:${file.startLine} - ${e.message}`);
-          }
-          break;
-        }
-      }
-    }
-  }
+  await annotateNewClones({ github, context, clones: cpdNew, makeRel });
 
   if (anyFail) {
     const msgs = [];
@@ -314,4 +396,5 @@ module.exports = {
   jscpdNewClones,
   renderEngineSection,
   checkFail,
+  annotateNewClones,
 };
