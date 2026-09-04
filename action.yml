@@ -303,7 +303,7 @@ runs:
         "$JSCPD" --pattern "$RESOLVED_JSCPD_PATTERN" --ignore "$RESOLVED_JSCPD_IGNORE" --reporters consoleFull,json --output jscpd-report --min-lines ${{ inputs.jscpd-min-lines }} --min-tokens ${{ inputs.jscpd-min-tokens }} || true
 
     - name: Generate combined duplicate report
-      uses: actions/github-script@v7
+      uses: actions/github-script@v9
       env:
         INPUT_DIRECTORIES: ${{ inputs.directories }}
         INPUT_FILE_EXTENSIONS: ${{ env.RESOLVED_FILE_EXTENSIONS }}
