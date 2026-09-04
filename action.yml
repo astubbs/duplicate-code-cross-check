@@ -75,12 +75,72 @@ runs:
       with:
         node-version: '22'
 
+    # THE ACTION MUST NOT INSTALL ANYTHING INTO THE TREE IT IS ABOUT TO MEASURE. A composite `run`
+    # step's working directory is $GITHUB_WORKSPACE, so this used to unzip a 79MB PMD distribution -
+    # 106 jars, plus the 80MB source zip - into the scanned directory. With `directories: '.'` the
+    # consequences were not cosmetic:
+    #   * auto-detection reported `jar` and `zip` as source extensions of the repository, and
+    #     `0/bin/pmd` / `0/LICENSE` from `pmd-bin-7.9.0/` cut after the patch number;
+    #   * `report.js` counts newline BYTES in every file matching that extension list, so PMD's own
+    #     jars inflated the line-count denominator 4.01x on parallel-consumer (793,019 vs 197,832).
+    #     Every CPD duplication percentage was therefore reported roughly four times too small, and
+    #     a `cpd-max-duplication` threshold calibrated against that reading is four times too loose.
+    # $RUNNER_TEMP is outside the workspace, is cleaned up by the runner, and is already on the same
+    # filesystem, so nothing else has to change.
     - name: Install PMD
       shell: bash
       run: |
+        set -euo pipefail
+        cd "$RUNNER_TEMP"
         wget -q "https://github.com/pmd/pmd/releases/download/pmd_releases%2F${{ inputs.pmd-version }}/pmd-dist-${{ inputs.pmd-version }}-bin.zip"
         unzip -q "pmd-dist-${{ inputs.pmd-version }}-bin.zip"
-        echo "$PWD/pmd-bin-${{ inputs.pmd-version }}/bin" >> $GITHUB_PATH
+        rm -f "pmd-dist-${{ inputs.pmd-version }}-bin.zip"
+        echo "$RUNNER_TEMP/pmd-bin-${{ inputs.pmd-version }}/bin" >> "$GITHUB_PATH"
+
+    # INSTALL THE JSCPD ENGINE HERE, NOT INSIDE THE STEPS THAT MEASURE IT.
+    #
+    # Both engine steps used to invoke `npx jscpd@4`. `npx` resolves the `4` range against the
+    # registry and, on a cold cache, downloads 118 packages - so the entire install landed on the
+    # FIRST call, which is the base-branch step, and the second call hit the npx cache. Measured on
+    # one consuming repository, same base sha, same commands, two runs 3.5 hours apart:
+    #
+    #                       base step   PR step   jscpd's own reported analysis time
+    #   healthy run            20.0s     12.3s    9.99s / 10.04s
+    #   timed-out run         288.4s     15.0s    12.07s / 12.18s
+    #
+    # The engines' own work was the same in both (jscpd's self-timer moved 21%, not 14x), and the PR
+    # step - which does identical work minus the install - stayed at ~14s. The 276s of silence at the
+    # front of the slow base step was one blocking network call. Locally, `npx jscpd@4` on an empty
+    # npm cache takes 98s at 2% CPU; on the runner it was 7s on a good day and ~262s on a bad one,
+    # and 288 + 15 + setup overruns the consuming job's 5-minute timeout - which GitHub then renders
+    # as "cancelled" rather than as a timeout.
+    #
+    # Installing once, before either measured step, makes the two steps symmetric AND makes the cost
+    # legible: a slow install is now a slow step with its own name and duration, not 4m36s of silence
+    # attributed to duplicate detection. The lockfile pins exact versions, so this resolves nothing
+    # at run time; `npx` re-resolved a range on every invocation.
+    - name: Install jscpd engine and report dependencies
+      shell: bash
+      env:
+        # npm's default fetch-timeout is 300000ms. A single stalled registry request can therefore
+        # consume a whole five-minute job budget before npm even considers a retry, which is the
+        # failure actually observed. Fail fast and retry instead.
+        npm_config_fetch_timeout: '30000'
+        npm_config_fetch_retries: '3'
+        npm_config_fetch_retry_maxtimeout: '20000'
+      run: |
+        set -euo pipefail
+        # Installed into $RUNNER_TEMP for the same reason PMD is: with `uses: ./` (the self-test, and
+        # anyone vendoring this action) $GITHUB_ACTION_PATH *is* the scanned workspace, and 118
+        # packages of node_modules must not appear in it.
+        TOOLS="$RUNNER_TEMP/duplicate-code-cross-check-tools"
+        mkdir -p "$TOOLS"
+        cp "$GITHUB_ACTION_PATH/package.json" "$GITHUB_ACTION_PATH/package-lock.json" "$TOOLS/"
+        started=$SECONDS
+        ( cd "$TOOLS" && npm ci --omit=dev --no-audit --no-fund )
+        echo "Engine and report dependencies installed in $(( SECONDS - started ))s"
+        echo "DUPCHECK_TOOLS=$TOOLS" >> "$GITHUB_ENV"
+        echo "JSCPD=$TOOLS/node_modules/.bin/jscpd" >> "$GITHUB_ENV"
 
     - name: Auto-detect language from source files
       id: detect
@@ -125,7 +185,9 @@ runs:
         if [[ "$NEED_SCAN" == "true" ]]; then
           echo "::group::Auto-detecting language from files in: $DIRS"
 
-          # Count files by extension, excluding common non-source directories
+          # Count files by extension, excluding common non-source directories.
+          # bin/detect-extensions.sh owns what counts as an extension and why; its header carries
+          # the malformed output this replaced, and bin/detect-extensions.test.js pins each case.
           declare -A LANG_COUNTS
           ALL_EXTENSIONS=()
 
@@ -139,7 +201,7 @@ runs:
                 LANG_COUNTS[$lang]=$(( ${LANG_COUNTS[$lang]:-0} + count ))
               fi
             fi
-          done < <(find $DIRS -type f -not -path '*/.git/*' -not -path '*/node_modules/*' -not -path '*/vendor/*' -not -path '*/__pycache__/*' -not -path '*/.venv/*' 2>/dev/null | grep '\.' | sed 's/.*\.//' | sort | uniq -c | sort -rn)
+          done < <(bash "$GITHUB_ACTION_PATH/bin/detect-extensions.sh" $DIRS)
 
           # Pick dominant CPD language (highest count, alphabetical tiebreak)
           BEST_LANG=""
@@ -196,6 +258,28 @@ runs:
           echo "RESOLVED_FILE_EXTENSIONS=${INPUT_FILE_EXT}" >> $GITHUB_ENV
         fi
 
+        # Both engines write their reports INTO the scanned workspace, so whichever runs second
+        # would otherwise tokenise the first one's output - `cpd-base.xml` is 148KB of XML that the
+        # base-branch run never sees. Appended to whatever the user asked to ignore, once, here,
+        # because both engine steps need the identical value.
+        OWN_OUTPUT_IGNORE='**/jscpd-base/**,**/jscpd-report/**,cpd-base.xml,cpd-pr.xml'
+        USER_IGNORE="${{ inputs.jscpd-ignore-pattern }}"
+        if [[ -n "$USER_IGNORE" ]]; then
+          echo "RESOLVED_JSCPD_IGNORE=${USER_IGNORE},${OWN_OUTPUT_IGNORE}" >> $GITHUB_ENV
+        else
+          echo "RESOLVED_JSCPD_IGNORE=${OWN_OUTPUT_IGNORE}" >> $GITHUB_ENV
+        fi
+
+    # THE TWO ENGINE STEPS MUST COST THE SAME. They analyse near-identical trees with identical
+    # commands, so any durable difference between them is something other than duplicate detection -
+    # and whatever it is lands on the base step, where it reads as "analysing the base branch is
+    # inherently slow". Both now invoke the same pre-installed binaries and differ only in which
+    # commit is checked out and which reporters are asked for. If they diverge again, that is the
+    # bug, not a property of the base branch.
+    #
+    # `RESOLVED_JSCPD_IGNORE` is the user's ignore list plus the action's own outputs; the detect
+    # step above says why. Without it the PR-branch run tokenises files the base-branch run never
+    # saw, which is duplication counted on one side of the comparison only.
     - name: Run both engines on base branch
       shell: bash
       run: |
@@ -205,7 +289,7 @@ runs:
         else
           echo "Skipping CPD on base branch (no supported language detected)"
         fi
-        npx jscpd@4 --pattern "$RESOLVED_JSCPD_PATTERN" --ignore "${{ inputs.jscpd-ignore-pattern }}" --reporters json --output jscpd-base --min-lines ${{ inputs.jscpd-min-lines }} --min-tokens ${{ inputs.jscpd-min-tokens }} 2>/dev/null || true
+        "$JSCPD" --pattern "$RESOLVED_JSCPD_PATTERN" --ignore "$RESOLVED_JSCPD_IGNORE" --reporters json --output jscpd-base --min-lines ${{ inputs.jscpd-min-lines }} --min-tokens ${{ inputs.jscpd-min-tokens }} 2>/dev/null || true
         git checkout ${{ github.sha }} --quiet
 
     - name: Run both engines on PR branch
@@ -216,12 +300,7 @@ runs:
         else
           echo "Skipping CPD on PR branch (no supported language detected)"
         fi
-        npx jscpd@4 --pattern "$RESOLVED_JSCPD_PATTERN" --ignore "${{ inputs.jscpd-ignore-pattern }}" --reporters consoleFull,json --output jscpd-report --min-lines ${{ inputs.jscpd-min-lines }} --min-tokens ${{ inputs.jscpd-min-tokens }} || true
-
-    - name: Install xml2js for report script
-      shell: bash
-      working-directory: ${{ github.action_path }}
-      run: npm install --no-save xml2js
+        "$JSCPD" --pattern "$RESOLVED_JSCPD_PATTERN" --ignore "$RESOLVED_JSCPD_IGNORE" --reporters consoleFull,json --output jscpd-report --min-lines ${{ inputs.jscpd-min-lines }} --min-tokens ${{ inputs.jscpd-min-tokens }} || true
 
     - name: Generate combined duplicate report
       uses: actions/github-script@v7
@@ -232,7 +311,7 @@ runs:
         INPUT_CPD_MAX_INCREASE: ${{ inputs.cpd-max-increase }}
         INPUT_JSCPD_MAX_PCT: ${{ inputs.jscpd-max-duplication }}
         INPUT_JSCPD_MAX_INCREASE: ${{ inputs.jscpd-max-increase }}
-        NODE_PATH: ${{ github.action_path }}/node_modules
+        NODE_PATH: ${{ env.DUPCHECK_TOOLS }}/node_modules
       with:
         github-token: ${{ inputs.github-token }}
         script: |

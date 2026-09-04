@@ -110,6 +110,28 @@ By default, all three language-sensitive inputs (`cpd-language`, `jscpd-file-pat
 
 Each input is resolved independently. You can override one while leaving the others on `auto` - for example, set `cpd-language: python` explicitly while letting jscpd pattern auto-detect.
 
+An extension is the suffix of a **file name** after its last dot, so `mvnw`, `LICENSE`,
+`.github/CODEOWNERS` and `.gitignore` contribute nothing, and a directory whose name contains a dot
+(`pmd-bin-7.9.0/`) is not mistaken for one. Archive, image, font and compiled-binary extensions are
+excluded, and listed in the step log rather than dropped silently: neither engine can tokenise them,
+and counting their newline *bytes* inflates the line total that every duplication percentage is
+divided by. The rules, and the malformed output that motivated each one, are in
+[`bin/detect-extensions.sh`](bin/detect-extensions.sh).
+
+## Where the action installs things
+
+Nowhere inside your repository. PMD and the jscpd engine are installed under `$RUNNER_TEMP`, so the
+tree being measured contains only your files - an action that unpacks 106 jars into the directory it
+is about to scan ends up reporting on itself. The engines' own outputs (`cpd-*.xml`, `jscpd-*/`) are
+written to the workspace, but are excluded from both scans so the base and PR runs see the same tree.
+
+jscpd is a pinned dependency of this action, installed once in its own step before either engine
+runs. It used to be invoked as `npx jscpd@4` from inside both engine steps, which put an unpinned
+range resolution and a first-use download of 118 packages inside the measurement - and on the
+base-branch step only, because the second call hit the npx cache. That made analysing the base
+branch look inherently ~19x more expensive than analysing the PR branch, and could overrun a
+5-minute job timeout on its own.
+
 ## Inputs
 
 | Input | Required | Default | Purpose |
