@@ -14,7 +14,7 @@
     "url": "https://github.com/astubbs/duplicate-code-cross-check.git"
   },
   "dependencies": {
-    "jscpd": "^4.3.0",
+    "jscpd": "^5.1.2",
     "xml2js": "^0.6.2"
   }
 }
